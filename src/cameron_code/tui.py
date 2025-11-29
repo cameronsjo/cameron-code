@@ -1,13 +1,14 @@
 """Cameron Code TUI - A simple terminal interface for Claude Code SDK."""
 
 import asyncio
+import random
 from datetime import datetime
 from typing import Any
 
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.widgets import (
     Footer,
     Header,
@@ -16,8 +17,8 @@ from textual.widgets import (
     Markdown,
     Static,
     LoadingIndicator,
+    ProgressBar,
 )
-from textual.message import Message as TextualMessage
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -25,10 +26,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     SystemMessage,
-    UserMessage,
     TextBlock,
     ToolUseBlock,
+    ToolResultBlock,
     ThinkingBlock,
+    HookMatcher,
+    PreToolUseHookInput,
+    PostToolUseHookInput,
 )
 
 from .tools import cameron_search, cameron_time
@@ -47,7 +51,25 @@ THINKING_VERBS = [
     "Cogitating",
     "Deliberating",
     "Ruminating",
+    "Musing",
+    "Reflecting",
+    "Weighing options",
+    "Brainstorming",
+    "Synthesizing",
 ]
+
+# Tool-specific verbs
+TOOL_VERBS = {
+    "Bash": ["Executing", "Running", "Processing"],
+    "Read": ["Reading", "Scanning", "Loading"],
+    "Write": ["Writing", "Saving", "Creating"],
+    "Edit": ["Editing", "Modifying", "Updating"],
+    "Glob": ["Searching", "Finding", "Locating"],
+    "Grep": ["Searching", "Matching", "Scanning"],
+    "Task": ["Spawning", "Delegating", "Launching"],
+    "WebFetch": ["Fetching", "Downloading", "Retrieving"],
+    "WebSearch": ["Searching", "Querying", "Looking up"],
+}
 
 
 class MessageDisplay(Static):
@@ -65,6 +87,7 @@ class MessageDisplay(Static):
             "system": "System",
             "tool": "Tool",
             "thinking": "Thinking",
+            "hook": "Hook",
         }.get(self.role, self.role)
 
         role_class = f"role-{self.role}"
@@ -75,21 +98,37 @@ class MessageDisplay(Static):
 class ThinkingIndicator(Static):
     """Animated thinking indicator with custom verbs."""
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, tool_name: str | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.tool_name = tool_name
         self.verb_index = 0
+
+        # Use tool-specific verbs if available
+        if tool_name and tool_name in TOOL_VERBS:
+            self.verbs = TOOL_VERBS[tool_name]
+        else:
+            self.verbs = THINKING_VERBS
 
     def compose(self) -> ComposeResult:
         yield LoadingIndicator()
-        yield Label(THINKING_VERBS[0], id="thinking-verb")
+        initial_verb = self.verbs[0]
+        if self.tool_name:
+            initial_verb = f"{initial_verb} ({self.tool_name})"
+        yield Label(initial_verb, id="thinking-verb")
 
     def on_mount(self) -> None:
-        self.set_interval(0.8, self._rotate_verb)
+        self.set_interval(0.6, self._rotate_verb)
 
     def _rotate_verb(self) -> None:
-        self.verb_index = (self.verb_index + 1) % len(THINKING_VERBS)
-        verb_label = self.query_one("#thinking-verb", Label)
-        verb_label.update(THINKING_VERBS[self.verb_index])
+        self.verb_index = (self.verb_index + 1) % len(self.verbs)
+        verb = self.verbs[self.verb_index]
+        if self.tool_name:
+            verb = f"{verb} ({self.tool_name})"
+        try:
+            verb_label = self.query_one("#thinking-verb", Label)
+            verb_label.update(verb)
+        except Exception:
+            pass
 
 
 class ChatContainer(VerticalScroll):
@@ -146,6 +185,11 @@ class CameronCodeApp(App):
         text-style: italic;
     }
 
+    .role-hook {
+        color: #888888;
+        text-style: dim;
+    }
+
     .message-content {
         padding-left: 2;
     }
@@ -186,20 +230,40 @@ class CameronCodeApp(App):
         dock: right;
         width: auto;
     }
+
+    #model-display {
+        dock: right;
+        width: auto;
+        margin-right: 2;
+        color: $text-muted;
+    }
+
+    #turns-display {
+        dock: right;
+        width: auto;
+        margin-right: 2;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear", "Clear"),
         Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+m", "switch_model", "Model"),
+        Binding("ctrl+h", "toggle_hooks", "Hooks"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self.client: ClaudeSDKClient | None = None
         self.total_cost: float = 0.0
+        self.total_turns: int = 0
         self.is_processing = False
         self._thinking_indicator: ThinkingIndicator | None = None
+        self.current_model = "sonnet"
+        self.show_hooks = False
+        self.tool_timings: dict[str, float] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -208,6 +272,8 @@ class CameronCodeApp(App):
             yield Input(placeholder="Ask Cameron anything... (or /command)", id="prompt-input")
         with Horizontal(id="status-bar"):
             yield Label("Ready", id="status-label")
+            yield Label("", id="turns-display")
+            yield Label("sonnet", id="model-display")
             yield Label("$0.0000", id="cost-display")
         yield Footer()
 
@@ -215,20 +281,74 @@ class CameronCodeApp(App):
         """Initialize the Claude client on mount."""
         self.query_one("#prompt-input", Input).focus()
 
-        # Welcome message
         chat = self.query_one("#chat-container", ChatContainer)
         chat.add_message(
             "system",
-            "Welcome to **Cameron Code**! 🎉\n\n"
-            "A custom Claude Code TUI with:\n"
+            "Welcome to **Cameron Code**!\n\n"
+            "Features:\n"
             "- Custom MCP tools (`cameron_search`, `cameron_time`)\n"
-            "- Audit logging & hooks\n"
-            "- Slash command support\n\n"
-            "Type a message or use `/commands` to see available slash commands."
+            "- Pre/Post tool hooks with timing\n"
+            "- Slash command support\n"
+            "- Model switching (Ctrl+M)\n\n"
+            "Bindings: `Ctrl+L` clear, `Ctrl+M` model, `Ctrl+H` hooks, `Esc` cancel"
         )
 
-        # Initialize client
         await self._init_client()
+
+    async def _pre_tool_hook(
+        self,
+        input: PreToolUseHookInput,
+        tool_use_id: str,
+        context: Any,
+    ) -> dict:
+        """Pre-tool hook - show what's about to run."""
+        tool_name = input.get("tool_name", "Unknown")
+        self.tool_timings[tool_use_id] = asyncio.get_event_loop().time()
+
+        if self.show_hooks:
+            chat = self.query_one("#chat-container", ChatContainer)
+            tool_input = input.get("tool_input", {})
+            preview = str(tool_input)[:100]
+            if len(str(tool_input)) > 100:
+                preview += "..."
+            chat.add_message("hook", f"**PreToolUse**: {tool_name}\n```\n{preview}\n```")
+
+        # Update thinking indicator with tool name
+        self._show_thinking(tool_name)
+
+        return {"continue_": True}
+
+    async def _post_tool_hook(
+        self,
+        input: PostToolUseHookInput,
+        tool_use_id: str,
+        context: Any,
+    ) -> dict:
+        """Post-tool hook - show timing."""
+        tool_name = input.get("tool_name", "Unknown")
+
+        # Calculate timing
+        start_time = self.tool_timings.pop(tool_use_id, None)
+        if start_time:
+            duration = asyncio.get_event_loop().time() - start_time
+            duration_str = f"{duration:.2f}s"
+        else:
+            duration_str = "?"
+
+        if self.show_hooks:
+            chat = self.query_one("#chat-container", ChatContainer)
+            output = input.get("tool_output", "")
+            if isinstance(output, str):
+                preview = output[:100]
+                if len(output) > 100:
+                    preview += "..."
+            else:
+                preview = str(output)[:100]
+            chat.add_message("hook", f"**PostToolUse**: {tool_name} ({duration_str})\n```\n{preview}\n```")
+
+        self._hide_thinking()
+
+        return {"continue_": True}
 
     async def _init_client(self) -> None:
         """Initialize the Claude SDK client."""
@@ -237,11 +357,22 @@ class CameronCodeApp(App):
             tools=[cameron_search, cameron_time],
         )
 
+        # Build hooks
+        hooks = {
+            "PreToolUse": [
+                HookMatcher(matcher="*", hooks=[self._pre_tool_hook]),
+            ],
+            "PostToolUse": [
+                HookMatcher(matcher="*", hooks=[self._post_tool_hook]),
+            ],
+        }
+
         options = ClaudeAgentOptions(
             mcp_servers={"cameron": cameron_server},
             setting_sources=["user", "project"],
+            hooks=hooks,
             cwd=".",
-            max_turns=20,
+            max_turns=25,
         )
 
         self.client = ClaudeSDKClient(options)
@@ -252,9 +383,9 @@ class CameronCodeApp(App):
         if info:
             commands = info.get("commands", [])
             if commands:
-                cmd_list = ", ".join(f"`/{c['name']}`" for c in commands[:10])
+                cmd_list = ", ".join(f"`/{c['name']}`" for c in commands[:8])
                 chat = self.query_one("#chat-container", ChatContainer)
-                chat.add_message("system", f"Available commands: {cmd_list}")
+                chat.add_message("system", f"Commands: {cmd_list}...")
 
     def _update_status(self, text: str) -> None:
         self.query_one("#status-label", Label).update(text)
@@ -262,12 +393,15 @@ class CameronCodeApp(App):
     def _update_cost(self) -> None:
         self.query_one("#cost-display", Label).update(f"${self.total_cost:.4f}")
 
-    def _show_thinking(self) -> None:
-        if not self._thinking_indicator:
-            self._thinking_indicator = ThinkingIndicator()
-            chat = self.query_one("#chat-container", ChatContainer)
-            chat.mount(self._thinking_indicator)
-            chat.scroll_end(animate=False)
+    def _update_turns(self) -> None:
+        self.query_one("#turns-display", Label).update(f"turns: {self.total_turns}")
+
+    def _show_thinking(self, tool_name: str | None = None) -> None:
+        self._hide_thinking()  # Remove existing first
+        self._thinking_indicator = ThinkingIndicator(tool_name=tool_name)
+        chat = self.query_one("#chat-container", ChatContainer)
+        chat.mount(self._thinking_indicator)
+        chat.scroll_end(animate=False)
 
     def _hide_thinking(self) -> None:
         if self._thinking_indicator:
@@ -284,14 +418,11 @@ class CameronCodeApp(App):
         if not prompt:
             return
 
-        # Clear input
         event.input.value = ""
 
-        # Add user message
         chat = self.query_one("#chat-container", ChatContainer)
         chat.add_message("user", prompt)
 
-        # Process with Claude
         await self._process_query(prompt)
 
     async def _process_query(self, prompt: str) -> None:
@@ -309,31 +440,44 @@ class CameronCodeApp(App):
             await self.client.query(prompt)
 
             current_text = ""
-            async for msg in self.client.receive_response():
-                self._hide_thinking()
+            tool_results_pending = False
 
+            async for msg in self.client.receive_response():
                 if isinstance(msg, AssistantMessage):
+                    # First, output any accumulated text before tool use
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             current_text += block.text
                         elif isinstance(block, ToolUseBlock):
-                            chat.add_message("tool", f"Using **{block.name}**...")
+                            # Output text before tool
+                            if current_text.strip():
+                                self._hide_thinking()
+                                chat.add_message("assistant", current_text)
+                                current_text = ""
+                            chat.add_message("tool", f"**{block.name}**")
+                            tool_results_pending = True
+                        elif isinstance(block, ToolResultBlock):
+                            tool_results_pending = False
                         elif isinstance(block, ThinkingBlock):
-                            # Show thinking in muted style
                             if block.thinking:
-                                thinking_preview = block.thinking[:200]
-                                if len(block.thinking) > 200:
-                                    thinking_preview += "..."
-                                chat.add_message("thinking", thinking_preview)
+                                preview = block.thinking[:150]
+                                if len(block.thinking) > 150:
+                                    preview += "..."
+                                chat.add_message("thinking", f"_{preview}_")
 
                 elif isinstance(msg, ResultMessage):
-                    if current_text:
+                    self._hide_thinking()
+                    if current_text.strip():
                         chat.add_message("assistant", current_text)
                         current_text = ""
 
                     if msg.total_cost_usd:
                         self.total_cost += msg.total_cost_usd
                         self._update_cost()
+
+                    if msg.num_turns:
+                        self.total_turns += msg.num_turns
+                        self._update_turns()
 
                     self._update_status("Ready")
 
@@ -351,7 +495,7 @@ class CameronCodeApp(App):
         """Clear the chat history."""
         chat = self.query_one("#chat-container", ChatContainer)
         chat.remove_children()
-        chat.add_message("system", "Chat cleared. Start fresh!")
+        chat.add_message("system", "Chat cleared.")
 
     async def action_cancel(self) -> None:
         """Cancel current operation."""
@@ -360,6 +504,29 @@ class CameronCodeApp(App):
             self._hide_thinking()
             self._update_status("Cancelled")
             self.is_processing = False
+
+    async def action_switch_model(self) -> None:
+        """Switch between models."""
+        if not self.client:
+            return
+
+        models = ["sonnet", "opus", "haiku"]
+        current_idx = models.index(self.current_model) if self.current_model in models else 0
+        next_idx = (current_idx + 1) % len(models)
+        self.current_model = models[next_idx]
+
+        await self.client.set_model(self.current_model)
+        self.query_one("#model-display", Label).update(self.current_model)
+
+        chat = self.query_one("#chat-container", ChatContainer)
+        chat.add_message("system", f"Switched to **{self.current_model}**")
+
+    def action_toggle_hooks(self) -> None:
+        """Toggle hook output visibility."""
+        self.show_hooks = not self.show_hooks
+        chat = self.query_one("#chat-container", ChatContainer)
+        state = "enabled" if self.show_hooks else "disabled"
+        chat.add_message("system", f"Hook output **{state}**")
 
     async def on_unmount(self) -> None:
         """Clean up on exit."""
